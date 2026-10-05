@@ -30,7 +30,7 @@ plugin_manager action=set_bundle target=dsh-plugin-jersey-billing enabled=true
 ## 装完做什么
 
 1. **重启 DSH**（替换包代码需要新进程才能加载新模块）
-2. 侧边栏底部会出现**钱包图标**，点开是「泽��计费统计」面板
+2. 侧边栏底部会出现**钱包图标**，点开是「泽西计费统计」面板
 3. 在「计费模型与单价」里填你自己的单价（每百万 token）：
    - 输入 / 1M
    - 输出 / 1M
