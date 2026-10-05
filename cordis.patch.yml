@@ -1,0 +1,26 @@
+# 泽西计费统计插件 bundle patch。
+#
+# 一个 insert 层：Host 半边负责跨会话用量聚合与单价持久化，
+# 浏览器半边（dsh.client 扫描 lib/client.js）负责侧边栏面板 UI。
+#
+# 这两行都按 id 寻址，你可以在 profile 的 cordis.patch.yml 里
+# 覆盖它们的 config 或 disabled。
+
+- insert:
+    - id: jersey-billing
+      name: 'dsh-plugin-jersey-billing'
+      config:
+        # 价格单位：每百万 token 的人民币价格（CNY / 1M tokens）。
+        # 面板里改价格会写进 storage 域，这里的值只作为首次运行的默认值。
+        currency: '¥'
+        # 统计时把缓存写入价格按缓存读取价格计算（部分中转站不单独计费缓存写入）。
+        cacheWriteAsRead: false
+        # 默认计价模型：面板里没配置价格的模型会回退到它。
+        defaultModel: 'deepseek-v4.1-flash'
+        # 首次运行的默认价目表（面板内可增删改，改完以面板为准）。
+        models:
+          - id: 'deepseek-v4.1-flash'
+            label: 'DeepSeek V4.1 Flash'
+            inputPerMillion: 0
+            outputPerMillion: 0
+            cacheReadPerMillion: 0
