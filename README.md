@@ -29,10 +29,31 @@
 单价单位是**每百万 token**（CNY）。统计时若某次请求的 usage 不完整（缺字段或数值非法），
 该次请求不计入，而不是猜一个值。
 
+### 峰谷分时计价
+
+DeepSeek 系列**不是全天同价**，而是按北京时间分峰谷：
+
+| 时段 | 输入基准价 | 输出基准价 | 说明 |
+|---|---|---|---|
+| **峰时** | 0.1 | 0.4 | 工作日 09:00–12:00、14:00–18:00 |
+| **谷时** | 0.05 | 0.2 | 其余全部时间 |
+
+谷时的判定规则（按优先级）：
+
+1. **法定节假日**全天按谷时（含调休连休的那几天）
+2. **周末**全天按谷时 —— 但**调休上班的周末例外**，按工作日走峰谷
+3. 工作日按上面的时段表判峰谷
+
+缓存命中价**跟随峰谷**，一般取输入价的 2%。
+
+插件内置了 **2025 / 2026 两年**的国务院调休日历（`src/peak.js`）。
+跨年后需要补一份新表；日历没覆盖到的年份，面板会给出提示。
+
 ## 界面位置
 
 - **侧边栏底部图标**：钱包图标，点击打开全屏面板。
-- **主面板**：顶部时间窗口切换 + 五张汇总卡 + 按模型明细表 + 单价编辑区。
+- **主面板**：顶部时间窗口切换 + 额度卡 + 五张汇总卡 + 按模型明细表 + 单价编辑区。
+- **明细表**里每个模型会显示「峰 N 次 ¥x / 谷 N 次 ¥y」的拆分。
 
 ## 配置
 
@@ -46,35 +67,44 @@
 | `defaultModel` | `deepseek-v4.1-flash` | 没有单独配置单价的模型回退到它 |
 | `models` | 见下 | 首次运行的默认价目表 |
 
+价目记录支持两种写法，可以混用：
+
 ```yaml
-- id: jersey-billing
-  name: 'dsh-plugin-jersey-billing'
-  config:
-    currency: '¥'
-    cacheWriteAsRead: false
-    defaultModel: 'deepseek-v4.1-flash'
-    models:
-      - id: 'deepseek-v4.1-flash'
-        label: 'DeepSeek V4.1 Flash'
-        inputPerMillion: 0
-        outputPerMillion: 0
-        cacheReadPerMillion: 0
+# 写法一：平铺（不分峰谷，全天同价）
+- id: 'some-flat-model'
+  inputPerMillion: 0.4
+  outputPerMillion: 2.0
+  cacheReadPerMillion: 0.02
+
+# 写法二：分峰谷
+- id: 'deepseek-v4.1-flash'
+  label: 'DeepSeek V4.1 Flash'
+  peak:
+    inputPerMillion: 0.825
+    outputPerMillion: 3.3
+    cacheReadPerMillion: 0.0165
+  offpeak:
+    inputPerMillion: 0.4125
+    outputPerMillion: 1.65
+    cacheReadPerMillion: 0.00825
 ```
+
+分峰谷时若某一档缺字段，会先回退到另一档，再回退到平铺字段。
 
 ## 单价怎么填（重要）
 
 **填「已含倍率」的最终单价，不要填基准价。**
 
 泽西后台每条记录会标一个倍率（例如「精选模型 **8.25x**」）。面板需要的是
-**基准价 × 倍率**之后的结果。
+**基准价 × 倍率**之后的结果。峰谷两档都要各自乘倍率。
 
-以 8.25x 倍率、基准价 `输入 0.05 / 输出 0.2 / 缓存 0.001`（元每百万）为例：
+以 8.25x 倍率为例：
 
-| 项目 | 基准价 | × 8.25 后应填 |
-|---|---|---|
-| 输入 / 1M | 0.05 | **0.4125** |
-| 输出 / 1M | 0.2 | **1.65** |
-| 缓存输入 / 1M | 0.001 | **0.00825** |
+| 项目 | 谷时基准价 | 谷时应填 | 峰时基准价 | 峰时应填 |
+|---|---|---|---|---|
+| 输入 / 1M | 0.05 | **0.4125** | 0.1 | **0.825** |
+| 输出 / 1M | 0.2 | **1.65** | 0.4 | **3.3** |
+| 缓存输入 / 1M | 0.001 | **0.00825** | 0.002 | **0.0165** |
 
 ### 怎么自查填得对不对
 
@@ -84,14 +114,22 @@
 面板总花费 ≈ 后台用量金额
 ```
 
-实测校准过程（可作为参考）：
+**注意后台「Tokens」列显示的是「总输入 / 输出」，而「缓存↓」是其中命中缓存的部分。**
+未命中输入 = 总输入 − 缓存读取。插件内部用的 `inputTokens` 已经是未命中输入，
+口径与这个公式一致。
 
-| 单价组合 | 面板算出 | 后台实际 |
-|---|---|---|
-| 0.825 / 3.3 / 0.0165 | ¥0.410769 | ¥0.205386 ❌ 高了 2 倍 |
-| **0.4125 / 1.65 / 0.00825** | **¥0.205384** | **¥0.205386** ✅ 误差 0.000002 |
+实测校准（10-08 工作日，8.25x 倍率，取后台 9 条记录）：
 
-差异**正好是 2.0000 倍**，说明基准价被记成了两倍。
+| 时间 | 总输入 | 缓存↓ | 输出 | 后台费用 | 插件算出 | 档 |
+|---|---|---|---|---|---|---|
+| 08:59:15 | 100582 | 98646 | 247 | 0.00202 | 0.002020 | 谷 |
+| 09:00:35 | 102718 | 102286 | 109 | 0.001202 | 0.001202 | 谷 |
+| 09:00:57 | 103667 | 102588 | 284 | 0.00352 | 0.003520 | 峰 |
+| 09:01:15 | 104062 | 103538 | 260 | 0.002998 | 0.002999 | 峰 |
+| 09:01:45 | 161131 | 0 | 519 | 0.134646 | 0.134646 | 峰 |
+
+9 条全部吻合到小数点后 6 位。注意后台的峰谷切换点比整点略晚几十秒
+（09:00:04 / 09:00:09 / 09:00:35 三条仍按谷价），插件按整点判定。
 
 ## 架构
 
@@ -103,7 +141,15 @@ dsh-plugin-jersey-billing/
 │   ├── index.js          # Host 半边：聚合用量 + 价目持久化 + HTTP 路由
 │   └── client.js         # 浏览器半边：预构建 __ModuleLoader__ bundle（面板 UI）
 └── src/
-    └── index.js          # Host 半边源码（与 lib/index.js 逐字节一致）
+    ├── index.js          # Host 半边源码
+    └── peak.js           # 峰谷时段判定 + 节假日/调休日历
+```
+
+**注意 `lib/index.js` 是构建产物**：`package.json` 的 `files` 只分发 `lib/`，
+所以 `src/peak.js` 会被**内联**进 `lib/index.js`。改完 `src/` 后必须重新构建：
+
+```powershell
+node build.mjs   # 或手工把 peak.js 去掉 export 后内联，见文件内注释
 ```
 
 ### 两半边如何通信
@@ -114,10 +160,28 @@ Typert Remote 产物（`typert.host.js` / `typert.remote-client.js`），对本�
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/jersey-billing/summary?window=today` | 按窗口聚合统计 |
+| `GET` | `/jersey-billing/summary?window=today&scope=jersey` | 按窗口聚合统计 |
+| `GET` | `/jersey-billing/balance?force=1` | 查泽西后台剩余额度 |
 | `GET` | `/jersey-billing/prices` | 读取价目表 |
 | `POST` | `/jersey-billing/prices` | 写入一条价目 |
 | `POST` | `/jersey-billing/prices/delete` | 删除一条价目 |
+
+`scope` 取 `jersey`（默认，只统计 `zexitongxue`）或 `all`（全部 provider）。
+
+### 额度卡
+
+`GET /jersey-billing/balance` 会去调泽西的 OpenAI 兼容 billing 端点：
+
+```
+GET https://zexitongxue.com/v1/dashboard/billing/subscription  → { hard_limit_usd }  总额度（元）
+GET https://zexitongxue.com/v1/dashboard/billing/usage         → { total_usage }      已用（分）
+```
+
+**两者单位不一致**（OpenAI 旧接口的历史遗留，泽西照抄了）：`hard_limit_usd` 是元，
+`total_usage` 是**分**。所以 `剩余 = hard_limit_usd - total_usage / 100`。
+
+泽西只暴露这两个**只读**端点，没有充值/改额度接口，插件不能自动充值。
+结果缓存 60 秒（失败也缓存），避免中转站挂掉时面板狂重试。
 
 ### 为什么不用 ctx.storageDomain
 

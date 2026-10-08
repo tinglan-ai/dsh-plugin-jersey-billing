@@ -29,6 +29,7 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
+import { isPeakTime, isCalendarCovered, PEAK_LABEL, OFF_PEAK_LABEL } from './peak.js'
 
 /** 统计窗口：今天 / 本周 / 本月 / 全部。 */
 const WINDOWS = ['today', 'week', 'month', 'all']
@@ -38,6 +39,23 @@ const PER_MILLION = 1_000_000
 
 /** 浏览器半边取数的路由前缀。 */
 const ROUTE_PATH = '/jersey-billing'
+
+/** 泽西中转站的 provider id（面板默认只统计它）。 */
+const JERSEY_PROVIDER = 'zexitongxue'
+
+/** 泽西余额查询：baseURL 与 OpenAI 兼容的 billing 端点。 */
+const JERSEY_BASE_URL = 'https://zexitongxue.com'
+const BILLING_SUBSCRIPTION = '/v1/dashboard/billing/subscription'
+const BILLING_USAGE = '/v1/dashboard/billing/usage'
+
+/** 余额缓存时长：避免每次刷新都打中转站。 */
+const BALANCE_TTL_MS = 60_000
+
+/** 峰时区间（北京时间），仅供面板展示。 */
+const PEAK_HOURS_DISPLAY = [
+  { from: 9, to: 12 },
+  { from: 14, to: 18 },
+]
 
 /**
  * 归一化 Loader 传入的 config。
@@ -65,14 +83,54 @@ function resolveConfig(config) {
       .map((model) => ({
         id: model.id,
         ...(typeof model.label === 'string' && model.label.length > 0 ? { label: model.label } : {}),
-        inputPerMillion: toPrice(model.inputPerMillion),
-        outputPerMillion: toPrice(model.outputPerMillion),
-        cacheReadPerMillion: toPrice(model.cacheReadPerMillion),
-        ...(model.cacheWritePerMillion === undefined || model.cacheWritePerMillion === null
-          ? {}
-          : { cacheWritePerMillion: toPrice(model.cacheWritePerMillion) }),
+        ...normalizePriceShape(model),
       })),
   }
+}
+
+/**
+ * 把一条价目记录归一化。
+ *
+ * 支持两种形状：
+ *   平铺：`{ inputPerMillion, outputPerMillion, cacheReadPerMillion }`
+ *   分峰谷：`{ peak: {...}, offpeak: {...} }`
+ *
+ * 两种可以混用：分峰谷时若某一档缺字段，回退到平铺字段（见 `tierPrice`）。
+ *
+ * @param raw - 原始记录。
+ * @returns 归一化后的记录（只含合法字段）。
+ */
+function normalizePriceShape(raw) {
+  const out = {}
+  const flat = {
+    inputPerMillion: toPrice(raw.inputPerMillion),
+    outputPerMillion: toPrice(raw.outputPerMillion),
+    cacheReadPerMillion: toPrice(raw.cacheReadPerMillion),
+  }
+  // 平铺字段只在「确实提供了」时写入，避免把分峰谷记录污染成平铺。
+  if (raw.inputPerMillion !== undefined) out.inputPerMillion = flat.inputPerMillion
+  if (raw.outputPerMillion !== undefined) out.outputPerMillion = flat.outputPerMillion
+  if (raw.cacheReadPerMillion !== undefined) out.cacheReadPerMillion = flat.cacheReadPerMillion
+  if (raw.cacheWritePerMillion !== undefined && raw.cacheWritePerMillion !== null) {
+    out.cacheWritePerMillion = toPrice(raw.cacheWritePerMillion)
+  }
+  for (const tier of ['peak', 'offpeak']) {
+    const source = raw[tier]
+    if (source === null || typeof source !== 'object') continue
+    const slot = {}
+    if (source.inputPerMillion !== undefined) slot.inputPerMillion = toPrice(source.inputPerMillion)
+    if (source.outputPerMillion !== undefined) {
+      slot.outputPerMillion = toPrice(source.outputPerMillion)
+    }
+    if (source.cacheReadPerMillion !== undefined) {
+      slot.cacheReadPerMillion = toPrice(source.cacheReadPerMillion)
+    }
+    if (source.cacheWritePerMillion !== undefined && source.cacheWritePerMillion !== null) {
+      slot.cacheWritePerMillion = toPrice(source.cacheWritePerMillion)
+    }
+    out[tier] = slot
+  }
+  return out
 }
 
 /** 把任意输入转成非负有限价格。 */
@@ -198,10 +256,14 @@ function foldSession(events, since) {
 
     const provider = route?.provider ?? 'unknown'
     const model = route?.model ?? 'unknown'
-    const key = `${provider}\u0000${model}`
+    // 峰谷分桶：泽西的 deepseek 系列按请求发生的北京时间分峰/谷两档单价。
+    // 桶键里带上 tier，聚合时两档分别计价再相加。
+    const tier = isPeakTime(event.time) ? 'peak' : 'offpeak'
+    const key = `${provider}\u0000${model}\u0000${tier}`
     const bucket = buckets.get(key) ?? {
       provider,
       model,
+      tier,
       inputTokens: 0,
       outputTokens: 0,
       cacheReadTokens: 0,
@@ -218,6 +280,87 @@ function foldSession(events, since) {
     buckets.set(key, bucket)
   }
   return buckets
+}
+
+/**
+ * 从 DSH 凭据文件里取泽西的 API key。
+ *
+ * 位置：DSH_HOME/.credentials.yaml 里的 `ZEXITONGXUE_API_KEY: sk-...`。
+ * 刻意不引入 YAML 解析库：只做一行正则，够用且零依赖。
+ *
+ * @returns API key，取不到时 undefined。
+ */
+function readJerseyApiKey() {
+  // 环境变量优先，方便用户覆盖。
+  const fromEnv = process.env.ZEXITONGXUE_API_KEY
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+
+  const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh')
+  let text
+  try {
+    text = readFileSync(join(home, '.credentials.yaml'), 'utf8')
+  } catch {
+    return undefined
+  }
+  const matched = text.match(/ZEXITONGXUE_API_KEY:\s*["']?([A-Za-z0-9_\-]+)["']?/)
+  return matched === null ? undefined : matched[1]
+}
+
+/**
+ * 查询泽西中转站的额度。
+ *
+ * 泽西实现了 OpenAI 旧版 billing 端点：
+ *   GET /v1/dashboard/billing/subscription → { hard_limit_usd }  总额度（元）
+ *   GET /v1/dashboard/billing/usage        → { total_usage }      已用（**分**）
+ *
+ * 注意两者单位不一致（这是 OpenAI 旧接口的历史遗留，泽西照抄了）：
+ * `hard_limit_usd` 是元，`total_usage` 是分。剩余额度 = 总额度 - 已用/100。
+ *
+ * @returns 额度快照；失败时返回带 error 的对象（不抛）。
+ */
+async function fetchJerseyBalance() {
+  const key = readJerseyApiKey()
+  if (key === undefined) {
+    return { ok: false, error: '没有找到泽西 API key（DSH_HOME/.credentials.yaml 里的 ZEXITONGXUE_API_KEY）' }
+  }
+
+  const call = async (path) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 10_000)
+    try {
+      const response = await fetch(`${JERSEY_BASE_URL}${path}`, {
+        headers: { authorization: `Bearer ${key}`, accept: 'application/json' },
+        signal: controller.signal,
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return await response.json()
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  try {
+    const [subscription, usage] = await Promise.all([
+      call(BILLING_SUBSCRIPTION),
+      call(BILLING_USAGE),
+    ])
+    const total = Number(subscription?.hard_limit_usd)
+    const usedCents = Number(usage?.total_usage)
+    if (!Number.isFinite(total) || !Number.isFinite(usedCents)) {
+      return { ok: false, error: '泽西返回的额度字段无法解析' }
+    }
+    const used = usedCents / 100
+    return {
+      ok: true,
+      provider: JERSEY_PROVIDER,
+      total,
+      used,
+      remaining: total - used,
+      checkedAt: Date.now(),
+    }
+  } catch (error) {
+    return { ok: false, error: `查询泽西额度失败：${String(error)}` }
+  }
 }
 
 /**
@@ -307,13 +450,45 @@ function readSessionEvents(file) {
   return events
 }
 
+/**
+ * 取某个模型在某个时段档位下的单价。
+ *
+ * 价目表支持两种写法：
+ *   1. 平铺（不分峰谷）：`{ inputPerMillion, outputPerMillion, cacheReadPerMillion }`
+ *   2. 分峰谷：`{ peak: {...}, offpeak: {...} }`
+ *
+ * 分峰谷时，缺失的档位回退到另一档；两档都缺则回退到平铺字段。
+ *
+ * @param price - 价目表里的一条记录。
+ * @param tier - `peak` | `offpeak`。
+ */
+function tierPrice(price, tier) {
+  if (price === undefined || price === null) return undefined
+  const other = tier === 'peak' ? 'offpeak' : 'peak'
+  const own = price[tier]
+  const fallback = price[other]
+  const source =
+    own !== null && typeof own === 'object'
+      ? own
+      : fallback !== null && typeof fallback === 'object'
+        ? fallback
+        : price
+  return {
+    inputPerMillion: source.inputPerMillion ?? price.inputPerMillion ?? 0,
+    outputPerMillion: source.outputPerMillion ?? price.outputPerMillion ?? 0,
+    cacheReadPerMillion: source.cacheReadPerMillion ?? price.cacheReadPerMillion ?? 0,
+    cacheWritePerMillion: source.cacheWritePerMillion ?? price.cacheWritePerMillion,
+  }
+}
+
 /** 按单价算一条 bucket 的费用明细。 */
 function priceBucket(bucket, price, options) {
-  const input = price?.inputPerMillion ?? 0
-  const output = price?.outputPerMillion ?? 0
-  const cacheRead = price?.cacheReadPerMillion ?? 0
+  const tiered = tierPrice(price, bucket.tier ?? 'offpeak')
+  const input = tiered?.inputPerMillion ?? 0
+  const output = tiered?.outputPerMillion ?? 0
+  const cacheRead = tiered?.cacheReadPerMillion ?? 0
   const cacheWrite =
-    options.cacheWriteAsRead === true ? cacheRead : price?.cacheWritePerMillion ?? input
+    options.cacheWriteAsRead === true ? cacheRead : tiered?.cacheWritePerMillion ?? input
 
   const uncachedCost = (bucket.inputTokens / PER_MILLION) * input
   const cacheReadCost = (bucket.cacheReadTokens / PER_MILLION) * cacheRead
@@ -433,12 +608,7 @@ export function apply(ctx, config) {
     for (const [id, price] of Object.entries(stored)) {
       if (price === null || typeof price !== 'object') continue
       overrides.set(id, {
-        inputPerMillion: toPrice(price.inputPerMillion),
-        outputPerMillion: toPrice(price.outputPerMillion),
-        cacheReadPerMillion: toPrice(price.cacheReadPerMillion),
-        ...(price.cacheWritePerMillion === undefined || price.cacheWritePerMillion === null
-          ? {}
-          : { cacheWritePerMillion: toPrice(price.cacheWritePerMillion) }),
+        ...normalizePriceShape(price),
         ...(typeof price.label === 'string' && price.label.length > 0 ? { label: price.label } : {}),
       })
     }
@@ -474,11 +644,15 @@ export function apply(ctx, config) {
    *   2. 未命中的会话并发读取（限流），而不是串行。
    *
    * @param window - today | week | month | all
+   * @param scope - jersey（只统计泽西）| all（全部 provider）
    */
-  async function aggregate(window) {
+  async function aggregate(window, scope) {
     const now = Date.now()
     const since = windowStart(WINDOWS.includes(window) ? window : 'today', now)
     const prices = readPrices()
+    // 默认只统计泽西：面板叫「泽西计费统计」，混入官方账号的调用会误导对账。
+    const onlyJersey = scope !== 'all'
+    const skippedProviders = new Set()
 
     // 直接扫描磁盘日志：多帧 zstd 解压全部会话约 0.3 秒，
     // 远快于 sessionQuery.readSession()（97 个会话会超时）。
@@ -502,11 +676,18 @@ export function apply(ctx, config) {
       if (events.length === 0) continue
       const buckets = foldSession(events, since)
       if (buckets.size === 0) continue
-      sessionCount += 1
+      let used = false
       for (const [key, bucket] of buckets) {
+        // provider 过滤：只统计泽西时，其他 provider 的用量整桶丢弃。
+        if (onlyJersey && bucket.provider !== JERSEY_PROVIDER) {
+          skippedProviders.add(bucket.provider)
+          continue
+        }
+        used = true
         const existing = totals.get(key) ?? {
           provider: bucket.provider,
           model: bucket.model,
+          tier: bucket.tier,
           inputTokens: 0,
           outputTokens: 0,
           cacheReadTokens: 0,
@@ -521,30 +702,113 @@ export function apply(ctx, config) {
         totals.set(key, existing)
         attempts += bucket.attempts
       }
+      if (used) sessionCount += 1
     }
 
     const rows = []
     const unpriced = new Set()
     let grandTotal = 0
+
+    // 先把「provider+model+tier」的桶按模型合并，再计价：
+    // 峰谷两档单价不同，所以合并时要保留两档各自的 token 数。
+    const merged = new Map()
     for (const bucket of totals.values()) {
-      const exact = prices.get(bucket.model)
+      const key = `${bucket.provider}\u0000${bucket.model}`
+      const row = merged.get(key) ?? {
+        provider: bucket.provider,
+        model: bucket.model,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        attempts: 0,
+        tiers: {},
+      }
+      row.inputTokens += bucket.inputTokens
+      row.outputTokens += bucket.outputTokens
+      row.cacheReadTokens += bucket.cacheReadTokens
+      row.cacheWriteTokens += bucket.cacheWriteTokens
+      row.attempts += bucket.attempts
+      const tier = bucket.tier ?? 'offpeak'
+      const slot = row.tiers[tier] ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        attempts: 0,
+      }
+      slot.inputTokens += bucket.inputTokens
+      slot.outputTokens += bucket.outputTokens
+      slot.cacheReadTokens += bucket.cacheReadTokens
+      slot.cacheWriteTokens += bucket.cacheWriteTokens
+      slot.attempts += bucket.attempts
+      row.tiers[tier] = slot
+      merged.set(key, row)
+    }
+
+    for (const row of merged.values()) {
+      const exact = prices.get(row.model)
       const price = exact ?? prices.get(resolved.defaultModel)
-      if (exact === undefined) unpriced.add(bucket.model)
-      const priced = priceBucket(bucket, price, resolved)
-      grandTotal += priced.cost
-      rows.push(priced)
+      if (exact === undefined) unpriced.add(row.model)
+
+      // 两档分别计价后相加。
+      let cost = 0
+      const tierDetail = {}
+      for (const [tier, slot] of Object.entries(row.tiers)) {
+        const priced = priceBucket({ ...slot, tier }, price, resolved)
+        cost += priced.cost
+        tierDetail[tier] = {
+          inputTokens: slot.inputTokens,
+          outputTokens: slot.outputTokens,
+          cacheReadTokens: slot.cacheReadTokens,
+          cacheWriteTokens: slot.cacheWriteTokens,
+          attempts: slot.attempts,
+          unitInput: priced.unitInput,
+          unitOutput: priced.unitOutput,
+          unitCacheRead: priced.unitCacheRead,
+          cost: priced.cost,
+        }
+      }
+
+      const offpeak = tierDetail.offpeak
+      const peak = tierDetail.peak
+      rows.push({
+        provider: row.provider,
+        model: row.model,
+        inputTokens: row.inputTokens,
+        outputTokens: row.outputTokens,
+        cacheReadTokens: row.cacheReadTokens,
+        cacheWriteTokens: row.cacheWriteTokens,
+        attempts: row.attempts,
+        priced: exact !== undefined,
+        tiers: tierDetail,
+        peakCost: peak?.cost ?? 0,
+        offpeakCost: offpeak?.cost ?? 0,
+        peakAttempts: peak?.attempts ?? 0,
+        offpeakAttempts: offpeak?.attempts ?? 0,
+        cost,
+      })
+      grandTotal += cost
     }
     rows.sort((a, b) => b.cost - a.cost)
 
     return {
       ok: true,
       window: WINDOWS.includes(window) ? window : 'today',
+      scope: onlyJersey ? 'jersey' : 'all',
+      jerseyProvider: JERSEY_PROVIDER,
+      skippedProviders: [...skippedProviders],
       since,
       now,
       currency: resolved.currency,
       cacheWriteAsRead: resolved.cacheWriteAsRead,
       defaultModel: resolved.defaultModel,
       persistent,
+      // 峰谷计价的元信息：面板据此显示「峰时/谷时」标签与日历提示。
+      peakHours: PEAK_HOURS_DISPLAY,
+      peakLabel: PEAK_LABEL,
+      offPeakLabel: OFF_PEAK_LABEL,
+      calendarCovered: isCalendarCovered(now),
       sessionCount,
       attempts,
       unpriced: [...unpriced],
@@ -576,12 +840,7 @@ export function apply(ctx, config) {
     const model = input?.model
     if (typeof model !== 'string' || model.length === 0) return { ok: false, error: '缺少模型 id' }
     const price = {
-      inputPerMillion: toPrice(input.inputPerMillion),
-      outputPerMillion: toPrice(input.outputPerMillion),
-      cacheReadPerMillion: toPrice(input.cacheReadPerMillion),
-      ...(input.cacheWritePerMillion === undefined || input.cacheWritePerMillion === null
-        ? {}
-        : { cacheWritePerMillion: toPrice(input.cacheWritePerMillion) }),
+      ...normalizePriceShape(input),
       ...(typeof input.label === 'string' && input.label.length > 0 ? { label: input.label } : {}),
     }
     overrides.set(model, price)
@@ -597,6 +856,22 @@ export function apply(ctx, config) {
     return { ok: true, persistent: persist() }
   }
 
+  /**
+   * 泽西额度快照，带 60 秒缓存。
+   * 中转站的 billing 接口有速率限制，面板 15 秒刷新一次不能次次都打过去。
+   */
+  let balanceCache
+  async function jerseyBalance(force) {
+    const now = Date.now()
+    if (force !== true && balanceCache !== undefined && now - balanceCache.at < BALANCE_TTL_MS) {
+      return balanceCache.value
+    }
+    const value = await fetchJerseyBalance()
+    // 查询失败也缓存，避免中转站挂掉时面板疯狂重试。
+    balanceCache = { at: now, value }
+    return value
+  }
+
   // ── 浏览器半边取数路由 ──────────────────────────────────────────────
   // 只读统计走 GET，改价目表走 POST（同源页面发起）。
   ctx.effect(
@@ -610,7 +885,18 @@ export function apply(ctx, config) {
             const action = url.pathname.slice(ROUTE_PATH.length).replace(/^\//, '') || 'summary'
 
             if (req.method === 'GET' && action === 'summary') {
-              sendJson(res, 200, await aggregate(url.searchParams.get('window') ?? 'today'))
+              sendJson(
+                res,
+                200,
+                await aggregate(
+                  url.searchParams.get('window') ?? 'today',
+                  url.searchParams.get('scope') ?? 'jersey',
+                ),
+              )
+              return
+            }
+            if (req.method === 'GET' && action === 'balance') {
+              sendJson(res, 200, await jerseyBalance(url.searchParams.get('force') === '1'))
               return
             }
             if (req.method === 'GET' && action === 'prices') {

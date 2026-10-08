@@ -18,9 +18,24 @@
         # 默认计价模型：面板里没配置价格的模型会回退到它。
         defaultModel: 'deepseek-v4.1-flash'
         # 首次运行的默认价目表（面板内可增删改，改完以面板为准）。
+        #
+        # 支持两种写法：
+        #   1. 平铺（不分峰谷）：inputPerMillion / outputPerMillion / cacheReadPerMillion
+        #   2. 分峰谷：peak / offpeak 两个子对象，字段同上
+        #
+        # DeepSeek 系列按北京时间分峰谷：
+        #   峰时（工作日 09:00–12:00、14:00–18:00）基准价 输入 0.1 / 输出 0.4
+        #   谷时（其余时间、周末、法定节假日）基准价 输入 0.05 / 输出 0.2
+        # 最终单价 = 基准价 × 中转站倍率（泽西「精选模型」当前 8.25x）。
+        # 缓存命中价跟随峰谷，一般为输入价的 2%。
         models:
           - id: 'deepseek-v4.1-flash'
             label: 'DeepSeek V4.1 Flash'
-            inputPerMillion: 0
-            outputPerMillion: 0
-            cacheReadPerMillion: 0
+            peak:
+              inputPerMillion: 0.825
+              outputPerMillion: 3.3
+              cacheReadPerMillion: 0.0165
+            offpeak:
+              inputPerMillion: 0.4125
+              outputPerMillion: 1.65
+              cacheReadPerMillion: 0.00825
