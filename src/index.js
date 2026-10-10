@@ -26,7 +26,7 @@
  * @module dsh-plugin-jersey-billing
  */
 
-import { readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 import { isPeakTime, isCalendarCovered, PEAK_LABEL, OFF_PEAK_LABEL } from './peak.js'
@@ -198,16 +198,20 @@ function windowStart(window, now) {
 }
 
 /**
- * 折叠一个会话的事件日志，得到按 (provider, model) 分组的用量。
+ * 折叠一个会话的事件日志，得到**按北京日期分组**的用量桶。
  *
  * 路由来自 `request/header`（仅在请求头变化时写入，故为「最近一次生效」语义），
  * 用量来自 `assistant/attempt`，两者按事件顺序配对。
  *
+ * 为什么按日期分组：会话日志会被用户删除，而中转站账单不会。
+ * 折叠结果要按天存进账本，删了日志也能从账本里把历史捞回来。
+ *
  * @param events - 该会话的 durable 事件。
  * @param since - 起始毫秒；0 表示不限。
+ * @returns `Map<YYYY-MM-DD, Map<桶键, 桶>>`
  */
 function foldSession(events, since) {
-  const buckets = new Map()
+  const byDay = new Map()
   let route
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
@@ -260,6 +264,12 @@ function foldSession(events, since) {
     // 桶键里带上 tier，聚合时两档分别计价再相加。
     const tier = isPeakTime(event.time) ? 'peak' : 'offpeak'
     const key = `${provider}\u0000${model}\u0000${tier}`
+    const day = beijingDayKey(event.time)
+    let buckets = byDay.get(day)
+    if (buckets === undefined) {
+      buckets = new Map()
+      byDay.set(day, buckets)
+    }
     const bucket = buckets.get(key) ?? {
       provider,
       model,
@@ -279,7 +289,7 @@ function foldSession(events, since) {
     if (event.time > bucket.lastTime) bucket.lastTime = event.time
     buckets.set(key, bucket)
   }
-  return buckets
+  return byDay
 }
 
 /**
@@ -543,6 +553,69 @@ function saveStoredPrices(table) {
   renameSync(temp, target)
 }
 
+/**
+ * 计费账本。
+ *
+ * 为什么需要它：会话日志会被用户删除（DSH 的会话管理里删掉就没了），
+ * 而中转站后台的账单不会跟着消失。如果只读磁盘日志，删一个会话，
+ * 那部分计费就从面板上凭空蒸发，永远对不上账。
+ *
+ * 所以每个会话的折叠结果按**北京日期**存进账本：
+ *   { version, sessions: { <sessionId>: { seenAt, days: { <YYYY-MM-DD>: { <桶键>: 桶 } } } } }
+ *
+ * 按日期存是为了让「今天 / 本周 / 本月 / 全部」四个窗口都能从账本里筛出来。
+ * 峰谷档位在折叠时已经定好，所以桶键里带 tier。
+ */
+/** 账本文件路径。 */
+function ledgerFile() {
+  const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '.', '.dsh')
+  return join(home, 'jersey-billing-ledger.json')
+}
+
+/** 读取账本；任何异常都当作「还没有账本」。 */
+function loadLedger() {
+  try {
+    const parsed = JSON.parse(readFileSync(ledgerFile(), 'utf8'))
+    if (parsed === null || typeof parsed !== 'object') return { version: 1, sessions: {} }
+    if (parsed.sessions === null || typeof parsed.sessions !== 'object') {
+      return { version: 1, sessions: {} }
+    }
+    return { version: 1, sessions: parsed.sessions }
+  } catch {
+    return { version: 1, sessions: {} }
+  }
+}
+
+/** 原子写入账本（不缩进：账本是机器读的，缩进会让文件大好几倍）。 */
+function saveLedger(ledger) {
+  const target = ledgerFile()
+  const temp = `${target}.tmp`
+  mkdirSync(dirname(target), { recursive: true })
+  writeFileSync(temp, JSON.stringify(ledger), 'utf8')
+  renameSync(temp, target)
+}
+
+/** 把一个毫秒时间戳换算成北京时间的 `YYYY-MM-DD`。 */
+function beijingDayKey(timeMs) {
+  const shifted = new Date(timeMs + 8 * 60 * 60 * 1000)
+  const year = shifted.getUTCFullYear()
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(shifted.getUTCDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+/** 取会话 id：优先读日志里的 session 头，其次用所在目录名。 */
+function sessionIdOf(events, file) {
+  for (const event of events) {
+    if (event.type === 'session' && typeof event.id === 'string' && event.id.length > 0) {
+      return event.id
+    }
+  }
+  const parts = String(file).split(/[\\/]/)
+  const dir = parts[parts.length - 2]
+  return typeof dir === 'string' && dir.length > 0 ? dir : undefined
+}
+
 /** 写一个 JSON 响应。 */
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload)
@@ -636,12 +709,64 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 扫描磁盘日志，把每个会话的用量按天写进账本。
+   *
+   * 这一步是「增量累积」：每次聚合都先刷新账本，然后**只从账本读数**。
+   * 这样用户删掉会话后，那部分历史仍然留在账本里，计费不会凭空消失。
+   *
+   * 只对「日志还在」的会话做刷新；日志已删除的会话在账本里原样保留。
+   *
+   * @returns `{ ledger, aliveIds }`：账本对象，以及当前磁盘上还存在日志的会话 id 集合。
+   */
+  function refreshLedger() {
+    const ledger = loadLedger()
+    const files = findLogFiles(sessionsRoot())
+    const aliveIds = new Set()
+    let dirty = false
+
+    for (const file of files) {
+      const events = readSessionEvents(file)
+      if (events.length === 0) continue
+      const sessionId = sessionIdOf(events, file)
+      if (sessionId === undefined) continue
+      aliveIds.add(sessionId)
+
+      // 折叠整个会话（since=0），按天分组。
+      const byDay = foldSession(events, 0)
+      if (byDay.size === 0) continue
+
+      let entry = ledger.sessions[sessionId]
+      if (entry === null || typeof entry !== 'object') {
+        entry = { seenAt: 0, days: {} }
+        ledger.sessions[sessionId] = entry
+      }
+      if (entry.days === null || typeof entry.days !== 'object') entry.days = {}
+
+      for (const [day, buckets] of byDay) {
+        const plain = {}
+        for (const [key, bucket] of buckets) plain[key] = bucket
+        // 日志是权威：同一天的桶直接覆盖（日志只会变多，不会变少）。
+        entry.days[day] = plain
+        dirty = true
+      }
+      entry.seenAt = Date.now()
+    }
+
+    if (dirty) {
+      try {
+        saveLedger(ledger)
+      } catch (error) {
+        ctx.logger?.warn?.(`jersey-billing: 账本写入失败：${String(error)}`)
+      }
+    }
+    return { ledger, aliveIds }
+  }
+
+  /**
    * 聚合全部会话的用量。
    *
-   * 性能要点：`readSession` 会做完整 replay 校验，97 个会话串行调用会超过
-   * 一分钟。这里做两件事：
-   *   1. 按会话缓存已折叠的用量桶，日志没变就不重复读；
-   *   2. 未命中的会话并发读取（限流），而不是串行。
+   * 数据源是**账本**而不是磁盘日志：日志会被用户删除，账本不会。
+   * 每次聚合前先刷新账本（把日志里的新用量累积进去），再从账本按窗口筛选。
    *
    * @param window - today | week | month | all
    * @param scope - jersey（只统计泽西）| all（全部 provider）
@@ -654,53 +779,57 @@ export function apply(ctx, config) {
     const onlyJersey = scope !== 'all'
     const skippedProviders = new Set()
 
-    // 直接扫描磁盘日志：多帧 zstd 解压全部会话约 0.3 秒，
-    // 远快于 sessionQuery.readSession()（97 个会话会超时）。
-    const files = findLogFiles(sessionsRoot())
+    // 先刷新账本，再从账本读数。
+    const { ledger, aliveIds } = refreshLedger()
 
     const totals = new Map()
     let sessionCount = 0
     let attempts = 0
+    let sessionTotal = 0
+    let deletedSessions = 0
 
-    for (const file of files) {
-      let stamp = 0
-      try {
-        stamp = statSync(file).mtimeMs
-      } catch {
-        continue
-      }
-      // 文件最后修改时间早于窗口起点 → 整个会话都在窗口外，跳过解压。
-      if (since > 0 && stamp < since) continue
-
-      const events = readSessionEvents(file)
-      if (events.length === 0) continue
-      const buckets = foldSession(events, since)
-      if (buckets.size === 0) continue
+    for (const [sessionId, entry] of Object.entries(ledger.sessions)) {
+      if (entry === null || typeof entry !== 'object') continue
+      const days = entry.days
+      if (days === null || typeof days !== 'object') continue
+      sessionTotal += 1
+      // 账本里有、磁盘上没有 → 这个会话已被删除，但用量仍保留。
+      if (!aliveIds.has(sessionId)) deletedSessions += 1
       let used = false
-      for (const [key, bucket] of buckets) {
-        // provider 过滤：只统计泽西时，其他 provider 的用量整桶丢弃。
-        if (onlyJersey && bucket.provider !== JERSEY_PROVIDER) {
-          skippedProviders.add(bucket.provider)
-          continue
+      for (const [day, plain] of Object.entries(days)) {
+        // 窗口过滤：按北京日期筛。`all` 时 since=0，全部保留。
+        if (since > 0) {
+          const dayStart = Date.parse(`${day}T00:00:00+08:00`)
+          if (!Number.isFinite(dayStart) || dayStart + 86_400_000 <= since) continue
         }
-        used = true
-        const existing = totals.get(key) ?? {
-          provider: bucket.provider,
-          model: bucket.model,
-          tier: bucket.tier,
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheWriteTokens: 0,
-          attempts: 0,
+        if (plain === null || typeof plain !== 'object') continue
+        for (const bucket of Object.values(plain)) {
+          if (bucket === null || typeof bucket !== 'object') continue
+          // provider 过滤：只统计泽西时，其他 provider 的用量整桶丢弃。
+          if (onlyJersey && bucket.provider !== JERSEY_PROVIDER) {
+            skippedProviders.add(bucket.provider)
+            continue
+          }
+          used = true
+          const key = `${bucket.provider}\u0000${bucket.model}\u0000${bucket.tier}`
+          const existing = totals.get(key) ?? {
+            provider: bucket.provider,
+            model: bucket.model,
+            tier: bucket.tier,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            attempts: 0,
+          }
+          existing.inputTokens += bucket.inputTokens ?? 0
+          existing.outputTokens += bucket.outputTokens ?? 0
+          existing.cacheReadTokens += bucket.cacheReadTokens ?? 0
+          existing.cacheWriteTokens += bucket.cacheWriteTokens ?? 0
+          existing.attempts += bucket.attempts ?? 0
+          totals.set(key, existing)
+          attempts += bucket.attempts ?? 0
         }
-        existing.inputTokens += bucket.inputTokens
-        existing.outputTokens += bucket.outputTokens
-        existing.cacheReadTokens += bucket.cacheReadTokens
-        existing.cacheWriteTokens += bucket.cacheWriteTokens
-        existing.attempts += bucket.attempts
-        totals.set(key, existing)
-        attempts += bucket.attempts
       }
       if (used) sessionCount += 1
     }
@@ -810,6 +939,9 @@ export function apply(ctx, config) {
       offPeakLabel: OFF_PEAK_LABEL,
       calendarCovered: isCalendarCovered(now),
       sessionCount,
+      // 账本里记录过、但日志已被删除的会话数（面板据此提示「已保留历史」）。
+      deletedSessions,
+      ledgerSessions: sessionTotal,
       attempts,
       unpriced: [...unpriced],
       rows,
