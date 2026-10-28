@@ -1,4 +1,4 @@
-# Znb 计费统计插件 bundle patch。
+# API 中转站计费统计插件 bundle patch。
 #
 # 一个 insert 层：Host 半边负责跨会话用量聚合与单价持久化，
 # 浏览器半边（dsh.client 扫描 lib/client.js）负责侧边栏面板 UI。
@@ -7,26 +7,29 @@
 # 覆盖它们的 config 或 disabled。
 
 - insert:
-    - id: znb-billing
+    - id: llm-billing
       name: 'dsh-plugin-jersey-billing'
       config:
+        # 唯一计入统计的 provider id（日志里 request/header 的 provider 值）。
+        # 换统计对象只改这一行，不用改代码：
+        #   泽西   → zexitongxue
+        #   Znb    → znb-gongsi
+        #   itkk   → itkk
+        provider: 'itkk'
         # 价格单位：每百万 token 的人民币价格（CNY / 1M tokens）。
-        # 面板里改价格会写进 DSH_HOME/znb-billing.json，这里的值只作为首次运行的默认值。
+        # 面板里改价格会写进 DSH_HOME/billing-prices.json，这里只作为首次运行的默认值。
         currency: '¥'
         # 首次运行的默认价目表（面板内可增删改，改完以面板为准）。
         #
-        # 统计范围硬编码为 provider = znb-gongsi：
-        # 同站点的 znbcode 账号、以及本机其他所有中转站都不计入。
-        #
-        # Znb 不分峰谷，全天单一价：
-        #   输入 0.30 / 百万 token
-        #   输出 1.20 / 百万 token
-        #   缓存读取 0.006 / 百万 token（输入价的 2%）
-        #   缓存写入不收费 → 0
+        # itkk 的 deepseek-v4.1-flash-1017：
+        #   输入      0.1    / 百万 token
+        #   输出      0.4    / 百万 token
+        #   缓存读取  0.002  / 百万 token
+        #   缓存写入  不收费 → 0
         models:
-          - id: 'deepseek-v4.1-flash'
-            label: 'DeepSeek V4.1 Flash'
-            inputPerMillion: 0.3
-            outputPerMillion: 1.2
-            cacheReadPerMillion: 0.006
+          - id: 'deepseek-v4.1-flash-1017'
+            label: 'DeepSeek V4.1 Flash 1017'
+            inputPerMillion: 0.1
+            outputPerMillion: 0.4
+            cacheReadPerMillion: 0.002
             cacheWritePerMillion: 0

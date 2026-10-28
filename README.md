@@ -1,24 +1,34 @@
-# Znb 计费统计插件
+# API 中转站计费统计插件
 
-按模型单价与实时用量统计 DSH **全部会话**在 Znb API 中转站（`znbcode.com`）的花费，
-支持 **今天 / 本周 / 本月 / 全部** 四个时间窗口切换，单价可在面板内直接编辑并持久化。
+按模型单价与实时用量统计 DSH **全部会话**在指定 API 中转站上的花费，支持
+**今天 / 本周 / 本月 / 全部** 四个时间窗口切换，单价可在面板内直接编辑并持久化。
 
 > **同事安装请看 [INSTALL.md](INSTALL.md)** —— 那里只有安装和使用的步骤。
 
-## 统计范围（硬编码，没有开关）
+## 统计范围：一个 provider，可配置
 
-只统计 **provider = `znb-gongsi`** 的调用。
+插件只统计 **一个 provider**，由 `cordis.patch.yml` 里的 `config.provider` 决定：
 
-本机在 `znbcode.com` 上配了两个账号，插件只认其中计费的那个：
+```yaml
+config:
+  provider: 'itkk'   # ← 只统计这一个
+```
+
+当前配置：
 
 | provider | 是否统计 | 说明 |
 |---|---|---|
-| `znb-gongsi` | **统计** | 走公司额度，本插件唯一统计对象 |
-| `znbcode` | 不统计 | 同一站点上的另一个账号 |
-| 其他所有 provider | 不统计 | 泽西、官方账号、别的中转站，一律不计 |
+| `itkk` | **统计** | 走 `https://itkk.lol/v1`，插件唯一统计对象 |
+| 其他所有 provider | 不统计 | 泽西、Znb、官方账号、别的中转站，一律不计 |
 
-这条规则写死在 Host 半边（`ZNB_PROVIDER`），面板上没有开关可以改。
-被排除的 provider 会在面板顶部列出来，方便你确认没算错东西。
+这条规则写死在 Host 半边，面板上没有开关。**换统计对象只改 `provider` 这一行，不用改代码，
+也不用换数据文件。** 换过几次都是这样改的：
+
+| 时期 | provider |
+|---|---|
+| 2026-10 之前 | `zexitongxue`（泽西） |
+| 2026-10-23 ~ 10-28 | `znb-gongsi`（Znb） |
+| 2026-10-23 起 | `itkk` |
 
 同理，**没有配置单价的模型也整条跳过**，不会回退到别的模型的价格去估算。
 
@@ -26,10 +36,10 @@
 
 - **全会话统计**：扫描 `DSH_HOME/sessions` 下所有会话日志，不限于当前会话。
 - **精确 token 口径**：区分未命中输入、缓存读取、缓存写入、输出四类 token。
-- **按模型计价**：路由取自 `request/header` 或 `assistant/message` 的 source，所以每个模型单独一行计价。
+- **按模型计价**：路由取自 `request/header` 或 `assistant/message` 的 source，每个模型单独一行。
 - **时间窗口**：今天 / 本周 / 本月 / 全部，默认今天，每 15 秒自动刷新。
-- **可视化改价**：面板内增删改模型单价，写入 `DSH_HOME/znb-billing.json`，重启后保留。
-- **删除会话不丢账**：用量按天存进 `DSH_HOME/znb-billing-ledger.json`，删掉会话历史花费仍然保留。
+- **可视化改价**：面板内增删改模型单价，写入 `DSH_HOME/billing-prices.json`，重启后保留。
+- **删除会话不丢账**：用量按天存进 `DSH_HOME/billing-ledger.json`，删掉会话历史花费仍然保留。
 
 ## 计价口径
 
@@ -42,39 +52,39 @@
      + 输出       / 1M × 输出单价
 ```
 
-单价单位是**每百万 token**（CNY）。统计时若某次请求的 usage 不完整（缺字段或数值非法），
+单价单位是**每百万 token**（CNY）。若某次请求的 usage 不完整（缺字段或数值非法），
 该次请求不计入，而不是猜一个值。
 
-### Znb 的默认单价
-
-Znb **不分峰谷**，全天单一价，缓存写入不收费：
+### 当前单价（itkk / deepseek-v4.1-flash-1017）
 
 | 项目 | 单价（¥ / 1M tokens） |
 |---|---|
-| 输入（未命中缓存） | **0.30** |
-| 输出 | **1.20** |
-| 缓存读取 | **0.006**（输入价的 2%） |
+| 输入（未命中缓存） | **0.1** |
+| 输出 | **0.4** |
+| 缓存读取 | **0.002** |
 | 缓存写入 | **0**（不收费） |
 
 这几个值是 `cordis.patch.yml` 里的默认价目，只用于首次运行。之后以面板里改过的为准，
-存在 `DSH_HOME/znb-billing.json`。
+存在 `DSH_HOME/billing-prices.json`。
 
-> 早期版本支持 DeepSeek 官方的「峰时 / 谷时」两档单价。Znb 是单一价，
-> 那套分峰谷逻辑已经整块移除，旧配置里的 `peak` / `offpeak` 字段会被忽略。
+> 早期版本支持过 DeepSeek 官方的「峰时 / 谷时」两档单价，那套逻辑已整块移除；
+> 旧配置里的 `peak` / `offpeak` 字段会被忽略。
 
 ## 界面位置
 
-- **侧边栏底部图标**：钱包图标「Znb 计费」，点击打开全屏面板。
-- **主面板**：顶部时间窗口切换 + 五张汇总卡 + 按模型明细表 + 单价编辑区。
+- **侧边栏底部图标**：「计费统计」，点击打开全屏面板。
+- **面板标题**：`<provider> 计费统计`，副标题写明「仅统计谁」。
+- **主面板**：时间窗口切换 + 五张汇总卡 + 按模型明细表 + 单价编辑区。
 - **明细表**里每个模型会显示它当前用的输入 / 输出单价，方便核对。
 
 ## 配置
 
 `cordis.patch.yml` 里的 `config` 只作为**首次运行的默认值**；面板里改过的价格以
-`DSH_HOME/znb-billing.json` 为准。
+`DSH_HOME/billing-prices.json` 为准。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
+| `provider` | `itkk` | 唯一计入统计的 provider id |
 | `currency` | `¥` | 金额符号 |
 | `models` | 见下 | 首次运行的默认价目表 |
 
@@ -82,22 +92,32 @@ Znb **不分峰谷**，全天单一价，缓存写入不收费：
 
 ```yaml
 models:
-  - id: 'deepseek-v4.1-flash'
-    label: 'DeepSeek V4.1 Flash'
-    inputPerMillion: 0.3
-    outputPerMillion: 1.2
-    cacheReadPerMillion: 0.006
+  - id: 'deepseek-v4.1-flash-1017'
+    label: 'DeepSeek V4.1 Flash 1017'
+    inputPerMillion: 0.1
+    outputPerMillion: 0.4
+    cacheReadPerMillion: 0.002
     cacheWritePerMillion: 0
 ```
 
 `cacheWritePerMillion` 可以省略，省略时按 0 计。
+
+## 换统计对象怎么做
+
+1. 改 `cordis.patch.yml` 里 `config.provider` 成新 provider id（要和日志里
+   `request/header.data.header.config.provider` 的值完全一致）；
+2. 把 `config.models` 换成新站点的模型与单价；
+3. `node build.mjs` 重新构建 `lib/index.js`；
+4. 重新安装到 profile（见 INSTALL.md），重启 DSH。
+
+数据文件不用改名 —— 账本只存当前 provider 的桶，换 provider 后账本会自然重建。
 
 ## 架构
 
 ```
 dsh-plugin-jersey-billing/
 ├── package.json          # dsh.bundle.patch + dsh.client.platform=web
-├── cordis.patch.yml      # bundle patch：插入 znb-billing 一行
+├── cordis.patch.yml      # bundle patch：插入 llm-billing 一行 + 价目
 ├── build.mjs             # 把 src/index.js 同步到 lib/index.js（带自检）
 ├── lib/
 │   ├── index.js          # Host 半边：聚合用量 + 价目持久化 + HTTP 路由
@@ -107,7 +127,7 @@ dsh-plugin-jersey-billing/
 ```
 
 包名保持 `dsh-plugin-jersey-billing` 没改（改包名要连带改 GitHub 仓库与所有安装路径，
-不值得）。**插件在 DSH 里的显示名、cordis id、路由前缀、数据文件全部是 `znb-billing`。**
+不值得）。插件在 DSH 里的 cordis id、路由前缀是 `llm-billing`，与具体中转站无关。
 
 `lib/index.js` 是 `src/index.js` 的完整副本 —— `package.json` 的 `files` 只分发 `lib/`，
 安装后没有 `src/`。改完 `src/` 后必须重新构建：
@@ -118,29 +138,22 @@ node build.mjs
 
 ### 两半边如何通信
 
-Host 半边通过 `ctx.webServer.register()` 注册一条 `prefix /znb-billing` 路由，
+Host 半边通过 `ctx.webServer.register()` 注册一条 `prefix /llm-billing` 路由，
 浏览器半边用 `fetch()` 取数。**没有**使用 `ctx.remote.<namespace>`，因为那需要生成式
 Typert Remote 产物（`typert.host.js` / `typert.remote-client.js`），对本插件过重。
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| `GET` | `/znb-billing/summary?window=today` | 按窗口聚合统计 |
-| `GET` | `/znb-billing/prices` | 读取价目表 |
-| `POST` | `/znb-billing/prices` | 写入一条价目 |
-| `POST` | `/znb-billing/prices/delete` | 删除一条价目 |
+| `GET` | `/llm-billing/summary?window=today` | 按窗口聚合统计 |
+| `GET` | `/llm-billing/prices` | 读取价目表 |
+| `POST` | `/llm-billing/prices` | 写入一条价目 |
+| `POST` | `/llm-billing/prices/delete` | 删除一条价目 |
 
-### 为什么没有额度卡
+### 没有额度卡
 
-泽西那套 [OI] 兼容 billing 端点（`/v1/dashboard/billing/subscription`、
-`/v1/dashboard/billing/usage`）在 Znb 上**不存在**，实测返回 404：
-
-```
-GET https://znbcode.com/v1/dashboard/billing/subscription  → 404 page not found
-GET https://znbcode.com/v1/dashboard/billing/usage         → 404 page not found
-```
-
-`/v1/models` 是通的，但没有任何额度查询接口。所以这个版本把额度卡整块移除了 ——
-与其显示一个永远报错的卡片，不如不放。
+OpenAI 旧版 billing 端点（`/v1/dashboard/billing/subscription`、`/usage`）在中转站上
+普遍不完整 —— 泽西实现了但单位混乱（元 vs 分），Znb 直接 404。所以面板不显示剩余额度，
+只统计花费。
 
 ### 计费账本
 
@@ -155,7 +168,7 @@ GET https://znbcode.com/v1/dashboard/billing/usage         → 404 page not foun
 
 - 每次聚合前先刷新账本，**日志是权威**（同一天的桶直接覆盖，日志只会变多不会变少）；
 - 聚合**只从账本读数**，所以日志被删的会话在账本里原样保留；
-- 账本存的是按天聚合后的桶，不是原始事件 —— 跑一年也就几百 KB。
+- 折叠时只保留 `config.provider` 的桶，账本里不会堆永远不统计的数据。
 
 ### 为什么不用 ctx.storageDomain
 
@@ -184,8 +197,7 @@ bundle 的 `id` 必须等于包名 `dsh-plugin-jersey-billing`。
 # 1. 安装（在 profile 目录执行）
 node <pnpm.mjs> add "file:E:\\工作文件夹\\DSH插件\\dsh-plugin-jersey-billing"
 
-# 2. 启用 bundle（也可用 plugin_manager 工具或 Web 插件页）
-#    plugin_manager action=set_bundle target=dsh-plugin-jersey-billing enabled=true
+# 2. 确认 profile 的 package.json bundles 里有 dsh-plugin-jersey-billing
 ```
 
 ## 数据来源与实测结论
@@ -218,12 +230,6 @@ offsets.push(buffer.length)
 它会对每个会话做**完整 replay 校验**。97 个会话实测**超过 90 秒直接超时**，
 面板永远停在「正在统计…」。直接读磁盘只要 **0.3 秒**。
 
-| 方式 | 97 个会话耗时 |
-|---|---|
-| `sessionQuery.readSession()` 串行 | **>90 秒（超时）** |
-| `sessionQuery.readSession()` 8 并发 | ~0.8 秒 |
-| **直接多帧解压磁盘日志** | **~0.3 秒** |
-
 ### 事件形状
 
 - 用量在 **`assistant/message.data.usage`**：
@@ -253,4 +259,3 @@ jsx-runtime 的签名是 **`jsx(type, props, key)`** —— children 必须写�
   会计为 0 而不是估算。
 - **活跃会话的最后一批事件可能尚未落盘**：DSH 按批追加帧，正在进行的对话
   最新几条可能还没写进文件。
-- **没有额度查询**：Znb 不提供 billing 接口（见上文），面板显示不了剩余额度。
